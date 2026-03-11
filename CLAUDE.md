@@ -27,9 +27,7 @@ spark2sql/
 │   └── rules/
 │       ├── __init__.py
 │       ├── functions.py             #   129 関数マッピング (@register デコレータ)
-│       ├── types.py                 #   PySpark DataType → BigQuery 型変換
-│       ├── join.py                  #   JOIN 種別変換
-│       └── window.py                #   Window 関数変換
+│       └── types.py                 #   PySpark DataType → BigQuery 型変換
 │
 ├── validator/                       # ローカル検証基盤
 │   ├── __init__.py
@@ -47,7 +45,8 @@ spark2sql/
 │       ├── sample_basic.py
 │       ├── sample_udf.py
 │       ├── sample_complex_window.py
-│       └── sample_nested_select.py
+│       ├── sample_nested_select.py
+│       └── sample.ipynb             #   Jupyter ノートブック版サンプル
 │
 ├── tests/
 │   ├── unit/
@@ -109,19 +108,28 @@ PySpark スクリプト (.py)
 
 | クラス | 対応 PySpark | 生成 SQL |
 |--------|-------------|---------|
-| `SourceTable` | `spark.table("t")` / `spark.read.*` | `FROM \`t\`` |
+| `SourceTable` | `spark.table("t")` / `spark.read.*` / `read.format().load()` | `FROM \`t\`` |
 | `SelectPlan` | `.select(...)` | `SELECT cols FROM ...` |
+| `SelectExprPlan` | `.selectExpr(...)` | `SELECT expr1, expr2 FROM ...` |
 | `FilterPlan` | `.filter(...)` / `.where(...)` | `WHERE cond` |
-| `GroupByPlan` | `.groupBy(...).agg(...)` | `GROUP BY ...` |
-| `JoinPlan` | `.join(other, on=..., how=...)` | `JOIN` |
+| `GroupByPlan` | `.groupBy(...).agg(...)` / `.rollup(...)` / `.cube(...)` | `GROUP BY ...` / `ROLLUP` / `CUBE` |
+| `JoinPlan` | `.join(...)` / `.crossJoin(...)` | `JOIN` / `CROSS JOIN` |
 | `OrderByPlan` | `.orderBy(...)` / `.sort(...)` | `ORDER BY` |
 | `LimitPlan` | `.limit(n)` | `LIMIT n` |
 | `DistinctPlan` | `.distinct()` / `.dropDuplicates(...)` | `DISTINCT` / ROW_NUMBER() |
 | `UnionPlan` | `.union(...)` / `.unionByName(...)` | `UNION ALL` / `UNION DISTINCT` |
+| `SetOpPlan` | `.intersect(...)` / `.intersectAll(...)` / `.subtract(...)` / `.exceptAll(...)` | `INTERSECT` / `EXCEPT` |
 | `WithColumnPlan` | `.withColumn(name, expr)` | `SELECT *, expr AS name` |
 | `DropPlan` | `.drop(...)` | `SELECT * EXCEPT(col)` |
 | `RenamePlan` | `.withColumnRenamed(old, new)` | `SELECT * EXCEPT(old), old AS new` |
 | `SubqueryPlan` | `.alias("name")` | `(subquery) AS name` |
+| `FillNaPlan` | `.fillna(...)` / `.na.fill(...)` | `COALESCE(col, value)` |
+| `DropNaPlan` | `.dropna(...)` / `.na.drop(...)` | `WHERE col IS NOT NULL` |
+| `ReplacePlan` | `.replace(...)` / `.na.replace(...)` | `CASE WHEN col = old THEN new END` |
+| `SamplePlan` | `.sample(fraction)` | `TABLESAMPLE SYSTEM (n PERCENT)` |
+| `ToDFPlan` | `.toDF("a", "b")` | 警告 + TODO（位置ベースリネーム） |
+| `PivotPlan` | `.groupBy(...).pivot(...).agg(...)` | `PIVOT(agg FOR col IN (...))` |
+| `UnpivotPlan` | `.unpivot(...)` / `.melt(...)` | `UNPIVOT(val FOR var IN (...))` |
 
 ## 関数マッピング — converter/rules/functions.py
 
@@ -163,6 +171,11 @@ PySpark スクリプト (.py)
 | `df.cache()` / `broadcast(df)` | BQ では不要 | 自動削除 |
 | `monotonically_increasing_id()` | BQ 非対応 | `ROW_NUMBER() OVER ()` + 警告 |
 | `F.factorial(c)` / map 型関数 | BQ 未対応 | `/* WARNING */` 付きで出力 |
+| `intersectAll` / `exceptAll` | BQ は ALL 未対応 | DISTINCT に変換 + 警告 |
+| `toDF("a", "b")` | 位置ベースリネームは SQL 不可 | 警告 + TODO コメント |
+| `fillna()` subset 未指定 | BQ では対象カラムの明示が必要 | 警告 + TODO コメント |
+| `pivot()` 値リスト未指定 | BQ PIVOT では値の明示が必須 | 警告 + TODO コメント |
+| `crosstab` / `describe` / `summary` | DataFrame 分析メソッド、SQL に直接変換不可 | 警告のみ |
 
 変換時に `/* WARNING: ... */` が SQL に含まれる場合、`ConversionResult.unsupported_patterns` にも自動収集される。
 

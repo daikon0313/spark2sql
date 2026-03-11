@@ -157,6 +157,7 @@ class GroupByPlan(Plan):
     source: Plan
     keys: tuple[Expr, ...]
     aggregations: tuple[Expr, ...]
+    mode: str = "normal"  # "normal" | "rollup" | "cube"
 
 
 class JoinType(Enum):
@@ -227,6 +228,93 @@ class RenamePlan(Plan):
 class SubqueryPlan(Plan):
     source: Plan
     alias: str
+
+
+@dataclass(frozen=True)
+class SelectExprPlan(Plan):
+    """selectExpr("expr1", "expr2 as alias") — SQL 式を直接 SELECT"""
+    source: Plan
+    expressions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FillNaPlan(Plan):
+    """fillna / na.fill — NULL を指定値で補完"""
+    source: Plan
+    value: Any
+    subset: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class DropNaPlan(Plan):
+    """dropna / na.drop — NULL 行を除去"""
+    source: Plan
+    how: str = "any"   # "any" | "all"
+    subset: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class SamplePlan(Plan):
+    """sample — ランダムサンプリング"""
+    source: Plan
+    fraction: float
+    seed: int | None = None
+
+
+@dataclass(frozen=True)
+class ReplacePlan(Plan):
+    """replace / na.replace — 値の置換"""
+    source: Plan
+    to_replace: dict[Any, Any]
+    subset: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class ToDFPlan(Plan):
+    """toDF — 全カラム名の一括変更"""
+    source: Plan
+    names: tuple[str, ...]
+
+
+class SetOpType(Enum):
+    INTERSECT = auto()
+    INTERSECT_ALL = auto()
+    EXCEPT = auto()
+    EXCEPT_ALL = auto()
+
+
+@dataclass(frozen=True)
+class SetOpPlan(Plan):
+    """intersect / intersectAll / subtract / exceptAll"""
+    left: Plan
+    right: Plan
+    op_type: SetOpType
+
+
+class GroupByMode(Enum):
+    NORMAL = auto()
+    ROLLUP = auto()
+    CUBE = auto()
+
+
+@dataclass(frozen=True)
+class PivotPlan(Plan):
+    """pivot — ピボットテーブル"""
+    source: Plan
+    keys: tuple[Expr, ...]
+    pivot_col: str
+    pivot_values: tuple[Any, ...]
+    aggregations: tuple[Expr, ...]
+
+
+@dataclass(frozen=True)
+class UnpivotPlan(Plan):
+    """unpivot / melt — アンピボット"""
+    source: Plan
+    ids: tuple[str, ...]
+    values: tuple[str, ...]
+    variable_column_name: str
+    value_column_name: str
 
 
 # ---------------------------------------------------------------------------

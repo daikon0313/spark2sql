@@ -445,5 +445,178 @@ result = df.orderBy(F.col("amount").desc())
         self.assertIn("GROUP BY", r.sql)
 
 
+class TestNewOperations(unittest.TestCase):
+    """新しく追加した DataFrame 操作のテスト"""
+
+    def test_select_expr(self):
+        code = """
+df = spark.table("t")
+result = df.selectExpr("col1", "col2 as c2", "sum(col3) as total")
+"""
+        result = sql(code)
+        self.assertIn("col1", result)
+        self.assertIn("col2 as c2", result)
+
+    def test_fillna_with_dict(self):
+        code = """
+df = spark.table("t")
+result = df.fillna({"col1": 0, "col2": "unknown"})
+"""
+        result = sql(code)
+        self.assertIn("COALESCE(", result)
+        self.assertIn("`col1`", result)
+
+    def test_fillna_with_subset(self):
+        code = """
+df = spark.table("t")
+result = df.fillna(0, subset=["amount", "qty"])
+"""
+        result = sql(code)
+        self.assertIn("COALESCE(`amount`", result)
+        self.assertIn("COALESCE(`qty`", result)
+
+    def test_na_fill(self):
+        code = """
+df = spark.table("t")
+result = df.na.fill({"status": "active"})
+"""
+        result = sql(code)
+        self.assertIn("COALESCE(", result)
+        self.assertIn("`status`", result)
+
+    def test_dropna_any(self):
+        code = """
+df = spark.table("t")
+result = df.dropna(how="any", subset=["col1", "col2"])
+"""
+        result = sql(code)
+        self.assertIn("`col1` IS NOT NULL", result)
+        self.assertIn("`col2` IS NOT NULL", result)
+
+    def test_dropna_all(self):
+        code = """
+df = spark.table("t")
+result = df.dropna("all", subset=["col1", "col2"])
+"""
+        result = sql(code)
+        self.assertIn("`col1` IS NULL", result)
+        self.assertIn("NOT (", result)
+
+    def test_na_drop(self):
+        code = """
+df = spark.table("t")
+result = df.na.drop(how="any", subset=["col1"])
+"""
+        result = sql(code)
+        self.assertIn("`col1` IS NOT NULL", result)
+
+    def test_intersect(self):
+        code = """
+df1 = spark.table("t1")
+df2 = spark.table("t2")
+result = df1.intersect(df2)
+"""
+        result = sql(code)
+        self.assertIn("INTERSECT DISTINCT", result)
+
+    def test_subtract(self):
+        code = """
+df1 = spark.table("t1")
+df2 = spark.table("t2")
+result = df1.subtract(df2)
+"""
+        result = sql(code)
+        self.assertIn("EXCEPT DISTINCT", result)
+
+    def test_cross_join(self):
+        code = """
+df1 = spark.table("t1")
+df2 = spark.table("t2")
+result = df1.crossJoin(df2)
+"""
+        result = sql(code)
+        self.assertIn("CROSS JOIN", result)
+
+    def test_todf(self):
+        code = """
+df = spark.table("t")
+result = df.toDF("a", "b", "c")
+"""
+        t = PySparkToBigQueryTransformer()
+        r = t.convert_single(code)
+        self.assertTrue(len(r.warnings) > 0)
+
+    def test_sample(self):
+        code = """
+df = spark.table("t")
+result = df.sample(0.1)
+"""
+        result = sql(code)
+        self.assertIn("TABLESAMPLE", result)
+
+    def test_replace_dict(self):
+        code = """
+df = spark.table("t")
+result = df.na.replace({"old_val": "new_val"}, subset=["col1"])
+"""
+        result = sql(code)
+        self.assertIn("CASE", result)
+        self.assertIn("`col1`", result)
+
+    def test_rollup(self):
+        code = """
+import pyspark.sql.functions as F
+df = spark.table("t")
+result = df.rollup("region", "status").agg(F.count("*").alias("cnt"))
+"""
+        result = sql(code)
+        self.assertIn("GROUP BY ROLLUP(", result)
+
+    def test_cube(self):
+        code = """
+import pyspark.sql.functions as F
+df = spark.table("t")
+result = df.cube("region", "status").agg(F.sum("amount").alias("total"))
+"""
+        result = sql(code)
+        self.assertIn("GROUP BY CUBE(", result)
+
+    def test_pivot(self):
+        code = """
+import pyspark.sql.functions as F
+df = spark.table("t")
+result = df.groupBy("region").pivot("status", ["active", "cancelled"]).agg(F.sum("amount"))
+"""
+        result = sql(code)
+        self.assertIn("PIVOT", result)
+        self.assertIn("`status`", result)
+
+    def test_unpivot(self):
+        code = """
+df = spark.table("t")
+result = df.unpivot(["id"], ["col1", "col2"], "variable", "value")
+"""
+        result = sql(code)
+        self.assertIn("UNPIVOT", result)
+
+    def test_read_format_load(self):
+        code = """
+df = spark.read.format("parquet").load("/path/to/data")
+result = df.select("col1")
+"""
+        t = PySparkToBigQueryTransformer()
+        r = t.convert_single(code)
+        self.assertIn("SELECT", r.sql)
+
+    def test_crosstab_warning(self):
+        code = """
+df = spark.table("t")
+result = df.crosstab("col1", "col2")
+"""
+        t = PySparkToBigQueryTransformer()
+        r = t.convert_single(code)
+        self.assertTrue(any("crosstab" in w for w in r.warnings))
+
+
 if __name__ == "__main__":
     unittest.main()

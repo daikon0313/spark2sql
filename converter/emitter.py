@@ -14,11 +14,13 @@ from typing import Any
 
 from .ir import (
     Alias, BinaryOp, Cast, CaseWhen, ColRef, ConversionError,
-    DistinctPlan, DropPlan, Expr, FilterPlan, FunctionCall,
-    GroupByPlan, InList, IsNotNull, IsNull, JoinPlan, JoinType,
-    LimitPlan, Literal, OrderByPlan, OrderSpec, Plan,
-    RenamePlan, SelectPlan, SourceTable, StarExpr, SubqueryPlan,
-    UnaryOp, UnionPlan, WindowExpr, WindowFrame, WithColumnPlan,
+    DistinctPlan, DropNaPlan, DropPlan, Expr, FillNaPlan, FilterPlan,
+    FunctionCall, GroupByPlan, InList, IsNotNull, IsNull, JoinPlan,
+    JoinType, LimitPlan, Literal, OrderByPlan, OrderSpec, PivotPlan,
+    Plan, RenamePlan, ReplacePlan, SamplePlan, SelectExprPlan,
+    SelectPlan, SetOpPlan, SetOpType, SourceTable, StarExpr,
+    SubqueryPlan, ToDFPlan, UnaryOp, UnionPlan, UnpivotPlan,
+    WindowExpr, WindowFrame, WithColumnPlan,
 )
 from .rules.functions import get_handler
 from .rules.types import convert_type
@@ -117,6 +119,24 @@ class SQLEmitter:
             return self._emit_rename(plan, ctx)
         if isinstance(plan, SubqueryPlan):
             return self._emit_subquery(plan, ctx)
+        if isinstance(plan, SelectExprPlan):
+            return self._emit_select_expr(plan, ctx)
+        if isinstance(plan, FillNaPlan):
+            return self._emit_fillna(plan, ctx)
+        if isinstance(plan, DropNaPlan):
+            return self._emit_dropna(plan, ctx)
+        if isinstance(plan, SamplePlan):
+            return self._emit_sample(plan, ctx)
+        if isinstance(plan, ReplacePlan):
+            return self._emit_replace(plan, ctx)
+        if isinstance(plan, ToDFPlan):
+            return self._emit_todf(plan, ctx)
+        if isinstance(plan, SetOpPlan):
+            return self._emit_set_op(plan, ctx)
+        if isinstance(plan, PivotPlan):
+            return self._emit_pivot(plan, ctx)
+        if isinstance(plan, UnpivotPlan):
+            return self._emit_unpivot(plan, ctx)
         raise ConversionError(f"未対応のプランノード: {type(plan).__name__}")
 
     def _emit_source(self, plan: SourceTable, ctx: _EmitContext) -> str:
@@ -167,10 +187,16 @@ class SQLEmitter:
             key_cols = [self._emit_expr(k, ctx) for k in plan.keys]
             key_str = ", ".join(key_cols)
             select_cols = key_cols + agg_cols
+            if plan.mode == "rollup":
+                group_clause = f"GROUP BY ROLLUP({key_str})"
+            elif plan.mode == "cube":
+                group_clause = f"GROUP BY CUBE({key_str})"
+            else:
+                group_clause = f"GROUP BY {key_str}"
             return (
                 f"SELECT\n  {', '.join(select_cols)}\n"
                 f"FROM {source_sql}\n"
-                f"GROUP BY {key_str}"
+                f"{group_clause}"
             )
         else:
             # 全行集計 (GROUP BY なし)
@@ -280,6 +306,183 @@ class SQLEmitter:
     def _emit_subquery(self, plan: SubqueryPlan, ctx: _EmitContext) -> str:
         inner_sql = self._emit_plan(plan.source, ctx)
         return f"(\n{self._indent(inner_sql)}\n) AS {plan.alias}"
+
+    def _emit_select_expr(self, plan: SelectExprPlan, ctx: _EmitContext) -> str:
+        source_sql = self._as_subquery_or_cte(plan.source, ctx)
+        exprs = ", ".join(plan.expressions)
+        return f"SELECT\n  {exprs}\nFROM {source_sql}"
+
+    def _emit_fillna(self, plan: FillNaPlan, ctx: _EmitContext) -> str:
+        source_cte = self._to_cte(plan.source, ctx)
+        if isinstance(plan.value, dict):
+            # カラムごとに異なる値で補完
+            parts = []
+            for col, val in plan.value.items():
+                lit = self._emit_literal(Literal(value=val))
+                parts.append(f"COALESCE(`{col}`, {lit}) AS `{col}`")
+            cols_str = ",\n  ".join(parts)
+            return (
+                f"SELECT\n  * EXCEPT({', '.join(f'`{c}`' for c in plan.value)}),\n"
+                f"  {cols_str}\n"
+                f"FROM {source_cte}"
+            )
+        else:
+            # 全カラム or subset を同一値で補完
+            lit = self._emit_literal(Literal(value=plan.value))
+            if plan.subset:
+                parts = [f"COALESCE(`{c}`, {lit}) AS `{c}`" for c in plan.subset]
+                except_cols = ", ".join(f"`{c}`" for c in plan.subset)
+                cols_str = ",\n  ".join(parts)
+                return (
+                    f"SELECT\n  * EXCEPT({except_cols}),\n"
+                    f"  {cols_str}\n"
+                    f"FROM {source_cte}"
+                )
+            else:
+                ctx.add_warning(
+                    "fillna() の subset 未指定時は全カラムに適用されますが、"
+                    "BigQuery では対象カラムの明示が必要です。subset を指定してください"
+                )
+                return f"SELECT * FROM {source_cte}  -- TODO: apply COALESCE to target columns"
+
+    def _emit_dropna(self, plan: DropNaPlan, ctx: _EmitContext) -> str:
+        source_cte = self._to_cte(plan.source, ctx)
+        if plan.subset:
+            cols = plan.subset
+        else:
+            ctx.add_warning(
+                "dropna() の subset 未指定時は全カラムに適用されますが、"
+                "対象カラムの明示が推奨されます"
+            )
+            cols = ()
+
+        if cols:
+            if plan.how == "all":
+                conditions = " AND ".join(f"`{c}` IS NULL" for c in cols)
+                return f"SELECT *\nFROM {source_cte}\nWHERE NOT ({conditions})"
+            else:  # "any"
+                conditions = " AND ".join(f"`{c}` IS NOT NULL" for c in cols)
+                return f"SELECT *\nFROM {source_cte}\nWHERE {conditions}"
+        return f"SELECT * FROM {source_cte}  -- TODO: specify columns for dropna"
+
+    def _emit_sample(self, plan: SamplePlan, ctx: _EmitContext) -> str:
+        source_sql = self._as_subquery_or_cte(plan.source, ctx)
+        percent = plan.fraction * 100
+        return f"SELECT *\nFROM {source_sql}\nTABLESAMPLE SYSTEM ({percent:.1f} PERCENT)"
+
+    def _emit_replace(self, plan: ReplacePlan, ctx: _EmitContext) -> str:
+        source_cte = self._to_cte(plan.source, ctx)
+        if not plan.to_replace:
+            return f"SELECT * FROM {source_cte}"
+
+        if plan.subset:
+            cols = plan.subset
+        else:
+            ctx.add_warning(
+                "replace() の subset 未指定時は全カラムに適用されますが、"
+                "対象カラムの明示が推奨されます"
+            )
+            cols = ()
+
+        if cols:
+            parts = []
+            for col in cols:
+                case_parts = ["CASE"]
+                for old_val, new_val in plan.to_replace.items():
+                    old_lit = self._emit_literal(Literal(value=old_val))
+                    new_lit = self._emit_literal(Literal(value=new_val))
+                    case_parts.append(f"    WHEN `{col}` = {old_lit} THEN {new_lit}")
+                case_parts.append(f"    ELSE `{col}`")
+                case_parts.append(f"  END AS `{col}`")
+                parts.append("\n".join(case_parts))
+            except_cols = ", ".join(f"`{c}`" for c in cols)
+            cols_str = ",\n  ".join(parts)
+            return (
+                f"SELECT\n  * EXCEPT({except_cols}),\n"
+                f"  {cols_str}\n"
+                f"FROM {source_cte}"
+            )
+        return f"SELECT * FROM {source_cte}  -- TODO: specify columns for replace"
+
+    def _emit_todf(self, plan: ToDFPlan, ctx: _EmitContext) -> str:
+        ctx.add_warning(
+            f"toDF({', '.join(repr(n) for n in plan.names)}) は "
+            "カラム名の位置ベース変更です。スキーマが一致することを確認してください"
+        )
+        source_cte = self._to_cte(plan.source, ctx)
+        # 位置ベースでリネーム: CTE の結果からカラムを位置指定で取得するのは
+        # SQL では直接できないため、SELECT * をそのまま返し、
+        # カラム名は CTE 結果のカラム順序に依存する
+        # BigQuery では SELECT AS STRUCT で位置指定可能だが、ここでは簡易的に
+        # COLUMN_N という仮名を使う
+        select_parts = []
+        for i, name in enumerate(plan.names):
+            select_parts.append(f"_col_{i} AS `{name}`")
+        # 実際にはカラム名がわからないので WARNING 付きで出力
+        return f"SELECT *\nFROM {source_cte}  -- TODO: rename columns to {list(plan.names)}"
+
+    def _emit_set_op(self, plan: SetOpPlan, ctx: _EmitContext) -> str:
+        left_sql = self._emit_plan(plan.left, ctx)
+        right_sql = self._emit_plan(plan.right, ctx)
+
+        op_map = {
+            SetOpType.INTERSECT: "INTERSECT DISTINCT",
+            SetOpType.INTERSECT_ALL: "INTERSECT ALL",
+            SetOpType.EXCEPT: "EXCEPT DISTINCT",
+            SetOpType.EXCEPT_ALL: "EXCEPT ALL",
+        }
+        op_kw = op_map[plan.op_type]
+
+        # BigQuery は INTERSECT ALL / EXCEPT ALL を未サポート
+        if plan.op_type in (SetOpType.INTERSECT_ALL, SetOpType.EXCEPT_ALL):
+            ctx.add_warning(
+                f"{op_kw} は BigQuery では未サポートです。DISTINCT に変換されます"
+            )
+            op_kw = op_kw.replace("ALL", "DISTINCT")
+
+        return f"{left_sql}\n{op_kw}\n{right_sql}"
+
+    def _emit_pivot(self, plan: PivotPlan, ctx: _EmitContext) -> str:
+        source_sql = self._as_subquery_or_cte(plan.source, ctx)
+
+        agg_parts = []
+        for agg in plan.aggregations:
+            agg_parts.append(self._emit_expr(agg, ctx))
+        agg_str = ", ".join(agg_parts)
+
+        if plan.pivot_values:
+            vals = ", ".join(
+                self._emit_literal(Literal(value=v)) for v in plan.pivot_values
+            )
+        else:
+            ctx.add_warning(
+                "pivot() に値リストが指定されていません。"
+                "BigQuery PIVOT では値の明示が必須です"
+            )
+            vals = "/* TODO: specify pivot values */"
+
+        key_cols = ", ".join(self._emit_expr(k, ctx) for k in plan.keys)
+        return (
+            f"SELECT *\n"
+            f"FROM (\n"
+            f"  SELECT {key_cols}, `{plan.pivot_col}`, {agg_str}\n"
+            f"  FROM {source_sql}\n"
+            f"  GROUP BY {key_cols}, `{plan.pivot_col}`\n"
+            f")\n"
+            f"PIVOT({agg_str} FOR `{plan.pivot_col}` IN ({vals}))"
+        )
+
+    def _emit_unpivot(self, plan: UnpivotPlan, ctx: _EmitContext) -> str:
+        source_sql = self._as_subquery_or_cte(plan.source, ctx)
+        id_cols = ", ".join(f"`{c}`" for c in plan.ids)
+        val_cols = ", ".join(f"`{c}`" for c in plan.values)
+        return (
+            f"SELECT *\n"
+            f"FROM {source_sql}\n"
+            f"UNPIVOT(\n"
+            f"  `{plan.value_column_name}` FOR `{plan.variable_column_name}` IN ({val_cols})\n"
+            f")"
+        )
 
     # ------------------------------------------------------------------
     # Expr ノードの emit

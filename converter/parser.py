@@ -31,12 +31,13 @@ from typing import Any
 
 from .ir import (
     Alias, BinaryOp, Cast, CaseWhen, ColRef, ConversionError,
-    DistinctPlan, DropPlan, Expr, FilterPlan, FunctionCall,
-    GroupByPlan, InList, IsNotNull, IsNull, JoinPlan, JoinType,
-    LimitPlan, Literal, OrderByPlan, OrderSpec, Plan,
-    RenamePlan, SelectPlan, SourceTable, StarExpr, SubqueryPlan,
-    UnaryOp, UnionPlan, UnsupportedPatternWarning, WindowExpr,
-    WindowFrame, WithColumnPlan,
+    DistinctPlan, DropNaPlan, DropPlan, Expr, FillNaPlan, FilterPlan,
+    FunctionCall, GroupByPlan, InList, IsNotNull, IsNull, JoinPlan,
+    JoinType, LimitPlan, Literal, OrderByPlan, OrderSpec, PivotPlan,
+    Plan, RenamePlan, ReplacePlan, SamplePlan, SelectExprPlan,
+    SelectPlan, SetOpPlan, SetOpType, SourceTable, StarExpr,
+    SubqueryPlan, ToDFPlan, UnaryOp, UnionPlan, UnpivotPlan,
+    UnsupportedPatternWarning, WindowExpr, WindowFrame, WithColumnPlan,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,16 @@ class _PendingGroupBy(Plan):
     """groupBy(...) だけで .agg() がまだ来ていない状態を保持する"""
     source: Plan
     keys: tuple
+    mode: str = "normal"  # "normal" | "rollup" | "cube"
+
+
+@_dc(frozen=True)
+class _PendingPivot(Plan):
+    """groupBy(...).pivot(...) で .agg() がまだ来ていない状態を保持する"""
+    source: Plan
+    keys: tuple
+    pivot_col: str
+    pivot_values: tuple
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +86,20 @@ _JOIN_TYPE_MAP: dict[str, JoinType] = {
 
 # DataFrame メソッド名 → 変換ハンドラ名のマッピング
 _DF_METHODS = {
-    "select", "filter", "where", "groupBy", "groupby",
-    "join", "orderBy", "sort", "limit", "distinct",
+    "select", "selectExpr", "filter", "where",
+    "groupBy", "groupby", "rollup", "cube",
+    "join", "crossJoin", "orderBy", "sort", "limit", "distinct",
     "dropDuplicates", "drop_duplicates", "union", "unionByName",
     "unionAll", "withColumn", "drop", "withColumnRenamed",
-    "alias",
-    "agg",
+    "alias", "agg",
+    "intersect", "intersectAll", "subtract", "exceptAll",
+    "fillna", "dropna", "toDF", "sample", "replace",
+    "unpivot", "melt",
+    "crosstab", "describe", "summary",
 }
+
+# na.fill / na.drop / na.replace のメソッド名
+_NA_METHODS = {"fill", "drop", "replace"}
 
 # ---------------------------------------------------------------------------
 # メインパーサー
@@ -220,6 +238,43 @@ class PySparkParser:
             path_arg = self._parse_string_arg(node, 0, method)
             return SourceTable(name=path_arg, source_type=method)
 
+        # ── spark.read.format("xxx").load("path") ──────────────────
+        if method == "load" and isinstance(obj, ast.Call):
+            if isinstance(obj.func, ast.Attribute) and obj.func.attr == "format":
+                if self._is_spark_read(obj.func.value):
+                    fmt = self._eval_string(obj.args[0]) if obj.args else "parquet"
+                    path_arg = self._parse_string_arg(node, 0, "load") if node.args else fmt
+                    return SourceTable(name=path_arg, source_type=fmt)
+
+        # ── df.na.fill / df.na.drop / df.na.replace ───────────────
+        if method in _NA_METHODS and isinstance(obj, ast.Attribute) and obj.attr == "na":
+            source_plan = self._parse_plan_expr(obj.value)
+            if source_plan is None and isinstance(obj.value, ast.Name):
+                source_plan = SourceTable(name=obj.value.id, source_type="reference")
+            if source_plan is None:
+                return None
+            if method == "fill":
+                return self._parse_fillna(source_plan, node)
+            if method == "drop":
+                return self._parse_dropna(source_plan, node)
+            if method == "replace":
+                return self._parse_replace(source_plan, node)
+
+        # ── pivot (groupBy(...).pivot(...).agg(...)) ───────────────
+        if method == "pivot":
+            source_plan = self._parse_plan_expr(obj)
+            if isinstance(source_plan, _PendingGroupBy):
+                pivot_col = self._eval_string(node.args[0])
+                pivot_values = ()
+                if len(node.args) > 1 and isinstance(node.args[1], ast.List):
+                    pivot_values = tuple(self._eval_literal(e) for e in node.args[1].elts)
+                return _PendingPivot(
+                    source=source_plan.source,
+                    keys=source_plan.keys,
+                    pivot_col=pivot_col,
+                    pivot_values=pivot_values,
+                )
+
         # ── DataFrame メソッドチェーン ─────────────────────────────
         if method not in _DF_METHODS:
             return None
@@ -246,6 +301,11 @@ class PySparkParser:
             cols = tuple(self._parse_col_expr(a) for a in args)
             return SelectPlan(source=source, columns=cols)
 
+        # selectExpr
+        if method == "selectExpr":
+            exprs = tuple(self._eval_string(a) for a in args)
+            return SelectExprPlan(source=source, expressions=exprs)
+
         # filter / where
         if method in ("filter", "where"):
             cond = self._parse_expr(args[0]) if args else self._parse_expr(kwargs["condition"])
@@ -254,21 +314,50 @@ class PySparkParser:
         # groupBy / groupby → .agg() は呼び出し元でチェーン
         if method in ("groupBy", "groupby"):
             keys = tuple(self._parse_col_expr(a) for a in args)
-            # groupBy(...).agg(...) のチェーンを1ノードにまとめる
             return _PendingGroupBy(source=source, keys=keys)
 
-        # agg (groupBy の後)
+        # rollup
+        if method == "rollup":
+            keys = tuple(self._parse_col_expr(a) for a in args)
+            return _PendingGroupBy(source=source, keys=keys, mode="rollup")
+
+        # cube
+        if method == "cube":
+            keys = tuple(self._parse_col_expr(a) for a in args)
+            return _PendingGroupBy(source=source, keys=keys, mode="cube")
+
+        # agg (groupBy / rollup / cube / pivot の後)
         if method == "agg":
+            if isinstance(source, _PendingPivot):
+                aggs = tuple(self._parse_expr(a) for a in args)
+                return PivotPlan(
+                    source=source.source,
+                    keys=source.keys,
+                    pivot_col=source.pivot_col,
+                    pivot_values=source.pivot_values,
+                    aggregations=aggs,
+                )
             if isinstance(source, _PendingGroupBy):
                 aggs = tuple(self._parse_expr(a) for a in args)
                 return GroupByPlan(
                     source=source.source,
                     keys=source.keys,
                     aggregations=aggs,
+                    mode=source.mode,
                 )
             # agg 単体 (groupBy なし) は全行集計
             aggs = tuple(self._parse_expr(a) for a in args)
             return GroupByPlan(source=source, keys=(), aggregations=aggs)
+
+        # crossJoin
+        if method == "crossJoin":
+            right_plan = self._parse_plan_expr(args[0])
+            if right_plan is None and isinstance(args[0], ast.Name):
+                right_plan = SourceTable(name=args[0].id, source_type="reference")
+            return JoinPlan(
+                left=source, right=right_plan,
+                condition=None, join_type=JoinType.CROSS,
+            )
 
         # join
         if method == "join":
@@ -358,7 +447,148 @@ class PySparkParser:
             alias_name = self._eval_string(args[0])
             return SubqueryPlan(source=source, alias=alias_name)
 
+        # intersect
+        if method == "intersect":
+            other = self._parse_plan_expr(args[0])
+            if other is None:
+                return None
+            return SetOpPlan(left=source, right=other, op_type=SetOpType.INTERSECT)
+
+        # intersectAll
+        if method == "intersectAll":
+            other = self._parse_plan_expr(args[0])
+            if other is None:
+                return None
+            return SetOpPlan(left=source, right=other, op_type=SetOpType.INTERSECT_ALL)
+
+        # subtract
+        if method == "subtract":
+            other = self._parse_plan_expr(args[0])
+            if other is None:
+                return None
+            return SetOpPlan(left=source, right=other, op_type=SetOpType.EXCEPT)
+
+        # exceptAll
+        if method == "exceptAll":
+            other = self._parse_plan_expr(args[0])
+            if other is None:
+                return None
+            return SetOpPlan(left=source, right=other, op_type=SetOpType.EXCEPT_ALL)
+
+        # fillna
+        if method == "fillna":
+            return self._parse_fillna(source, call)
+
+        # dropna
+        if method == "dropna":
+            return self._parse_dropna(source, call)
+
+        # replace
+        if method == "replace":
+            return self._parse_replace(source, call)
+
+        # toDF
+        if method == "toDF":
+            names = tuple(self._eval_string(a) for a in args)
+            return ToDFPlan(source=source, names=names)
+
+        # sample
+        if method == "sample":
+            fraction = 0.1
+            seed = None
+            if args:
+                # sample(withReplacement, fraction, seed) or sample(fraction)
+                if isinstance(args[0], ast.Constant) and isinstance(args[0].value, bool):
+                    # sample(False, 0.1) or sample(False, 0.1, 42)
+                    fraction = float(self._eval_literal(args[1])) if len(args) > 1 else 0.1
+                    seed = self._eval_int(args[2]) if len(args) > 2 else None
+                else:
+                    fraction = float(self._eval_literal(args[0]))
+                    seed = self._eval_int(args[1]) if len(args) > 1 else None
+            if "fraction" in kwargs:
+                fraction = float(self._eval_literal(kwargs["fraction"]))
+            if "seed" in kwargs:
+                seed = self._eval_int(kwargs["seed"])
+            return SamplePlan(source=source, fraction=fraction, seed=seed)
+
+        # unpivot / melt
+        if method in ("unpivot", "melt"):
+            ids_node = args[0] if args else kwargs.get("ids")
+            values_node = args[1] if len(args) > 1 else kwargs.get("values")
+            var_col = self._eval_string(args[2]) if len(args) > 2 else kwargs.get("variableColumnName", "variable")
+            val_col = self._eval_string(args[3]) if len(args) > 3 else kwargs.get("valueColumnName", "value")
+            if isinstance(var_col, ast.expr):
+                var_col = self._eval_string(var_col)
+            if isinstance(val_col, ast.expr):
+                val_col = self._eval_string(val_col)
+            ids = tuple(self._eval_string(e) for e in ids_node.elts) if isinstance(ids_node, ast.List) else ()
+            values = tuple(self._eval_string(e) for e in values_node.elts) if isinstance(values_node, ast.List) else ()
+            return UnpivotPlan(
+                source=source, ids=ids, values=values,
+                variable_column_name=var_col, value_column_name=val_col,
+            )
+
+        # crosstab / describe / summary → WARNING
+        if method in ("crosstab", "describe", "summary"):
+            self._warnings.append(
+                f"{method}() は BigQuery SQL に直接変換できません。手動で書き換えてください"
+            )
+            return source
+
         return None
+
+    # ------------------------------------------------------------------
+    # fillna / dropna / replace ヘルパー
+    # ------------------------------------------------------------------
+
+    def _parse_fillna(self, source: Plan, call: ast.Call) -> Plan:
+        args = call.args
+        kwargs_map = {kw.arg: kw.value for kw in call.keywords}
+        value = self._eval_literal(kwargs_map.get("value", args[0] if args else None))
+        subset: tuple[str, ...] | None = None
+        subset_node = kwargs_map.get("subset", args[1] if len(args) > 1 else None)
+        if subset_node and isinstance(subset_node, ast.List):
+            subset = tuple(self._eval_string(e) for e in subset_node.elts)
+        # value が dict の場合: fillna({"col1": 0, "col2": "x"})
+        if args and isinstance(args[0], ast.Dict):
+            value = {}
+            for k, v in zip(args[0].keys, args[0].values):
+                value[self._eval_string(k)] = self._eval_literal(v)
+        return FillNaPlan(source=source, value=value, subset=subset)
+
+    def _parse_dropna(self, source: Plan, call: ast.Call) -> Plan:
+        args = call.args
+        kwargs_map = {kw.arg: kw.value for kw in call.keywords}
+        how = "any"
+        if "how" in kwargs_map:
+            how = self._eval_string(kwargs_map["how"])
+        elif args and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
+            how = args[0].value
+        subset: tuple[str, ...] | None = None
+        subset_node = kwargs_map.get("subset")
+        if subset_node and isinstance(subset_node, ast.List):
+            subset = tuple(self._eval_string(e) for e in subset_node.elts)
+        return DropNaPlan(source=source, how=how, subset=subset)
+
+    def _parse_replace(self, source: Plan, call: ast.Call) -> Plan:
+        args = call.args
+        kwargs_map = {kw.arg: kw.value for kw in call.keywords}
+        to_replace: dict = {}
+        if args and isinstance(args[0], ast.Dict):
+            for k, v in zip(args[0].keys, args[0].values):
+                to_replace[self._eval_literal(k)] = self._eval_literal(v)
+        elif len(args) >= 2:
+            old_val = self._eval_literal(args[0])
+            new_val = self._eval_literal(args[1])
+            if isinstance(old_val, list) and isinstance(new_val, list):
+                to_replace = dict(zip(old_val, new_val))
+            else:
+                to_replace = {old_val: new_val}
+        subset: tuple[str, ...] | None = None
+        subset_node = kwargs_map.get("subset")
+        if subset_node and isinstance(subset_node, ast.List):
+            subset = tuple(self._eval_string(e) for e in subset_node.elts)
+        return ReplacePlan(source=source, to_replace=to_replace, subset=subset)
 
     # ------------------------------------------------------------------
     # 式の解析
