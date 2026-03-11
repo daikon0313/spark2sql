@@ -4,9 +4,9 @@
 # 起動:
 #   docker compose up -d
 #
-# Spark UI:       http://localhost:4040
-# Spark Master:   http://localhost:8080
-# Jupyter:        http://localhost:8888  (token: dev)
+# Spark Master UI: http://localhost:8080
+# Spark App UI:    http://localhost:4040  (ジョブ実行中のみ)
+# Jupyter:         http://localhost:8888  (token: dev)
 # ─────────────────────────────────────────────────────────────────────
 
 services:

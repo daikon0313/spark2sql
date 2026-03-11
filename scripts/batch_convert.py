@@ -3,7 +3,8 @@
 ディレクトリ一括変換 + レポート出力
 
 Usage:
-  python scripts/batch_convert.py ./pipelines/
+  python scripts/batch_convert.py                          # base_code/ → converted_code/
+  python scripts/batch_convert.py ./pipelines/             # 任意ディレクトリ指定
   python scripts/batch_convert.py ./pipelines/ --out ./sql_output/
   python scripts/batch_convert.py ./pipelines/ --report report.json
 """
@@ -47,8 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="ディレクトリ配下の PySpark スクリプトを一括で BigQuery SQL に変換する",
     )
-    parser.add_argument("dir", help="変換対象ディレクトリ")
-    parser.add_argument("--out", help="SQL 出力先ディレクトリ")
+    project_root = Path(__file__).resolve().parent.parent
+    default_base = str(project_root / "base_code")
+    default_out = str(project_root / "converted_code")
+
+    parser.add_argument("dir", nargs="?", default=default_base, help="変換対象ディレクトリ (デフォルト: base_code/)")
+    parser.add_argument("--out", default=default_out, help="SQL 出力先ディレクトリ (デフォルト: converted_code/)")
     parser.add_argument("--report", help="JSON レポート出力先")
     parser.add_argument("--recursive", action="store_true", help="サブディレクトリも再帰的に探索")
     args = parser.parse_args(argv)
