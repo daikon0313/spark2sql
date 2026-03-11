@@ -95,6 +95,9 @@ def main(argv: list[str] | None = None) -> int:
     # サマリー出力
     _print_summary(report)
 
+    # summary.md 出力 (converted_code/ と同じディレクトリ)
+    _write_summary_md(report, out_dir)
+
     # JSON レポート
     if args.report:
         report_path = Path(args.report)
@@ -183,6 +186,68 @@ def _print_summary(report: BatchReport) -> None:
     print(f"  自動変換率: {report.auto_conversion_rate:.1%}", file=sys.stderr)
     print(f"  処理時間:   {report.elapsed_seconds:.3f}s", file=sys.stderr)
     print("=" * 50, file=sys.stderr)
+
+    # OK 以外のファイルの詳細を出力
+    non_ok = [f for f in report.files if f.status != "success"]
+    if non_ok:
+        print("\n--- 要確認ファイル ---", file=sys.stderr)
+        for f in non_ok:
+            sql_name = Path(f.sql_path).name if f.sql_path else "(未出力)"
+            print(f"\n  [{f.status.upper()}] {sql_name}", file=sys.stderr)
+            if f.error:
+                print(f"    エラー: {f.error}", file=sys.stderr)
+            for w in f.warnings:
+                print(f"    警告: {w}", file=sys.stderr)
+        print("", file=sys.stderr)
+
+
+def _write_summary_md(report: BatchReport, out_dir: Path | None) -> None:
+    """converted_code/summary.md にサマリーを出力する"""
+    if out_dir is None:
+        return
+
+    lines: list[str] = []
+    lines.append("# 変換結果サマリー\n")
+    lines.append(f"| 項目 | 値 |")
+    lines.append(f"|------|-----|")
+    lines.append(f"| 合計 | {report.total} ファイル |")
+    lines.append(f"| 成功 | {report.success} |")
+    lines.append(f"| 警告あり | {report.warning} |")
+    lines.append(f"| エラー | {report.error} |")
+    lines.append(f"| 自動変換率 | {report.auto_conversion_rate:.1%} |")
+    lines.append(f"| 処理時間 | {report.elapsed_seconds:.3f}s |")
+    lines.append("")
+
+    # ファイル一覧
+    lines.append("## ファイル一覧\n")
+    lines.append("| ファイル | ステータス | 詳細 |")
+    lines.append("|---------|----------|------|")
+    for f in report.files:
+        sql_name = Path(f.sql_path).name if f.sql_path else "-"
+        if f.status == "success":
+            lines.append(f"| {sql_name} | OK | - |")
+        elif f.status == "warning":
+            lines.append(f"| {sql_name} | WARNING | {len(f.warnings)} 件の警告 |")
+        else:
+            lines.append(f"| {sql_name} | ERROR | {f.error or '不明'} |")
+    lines.append("")
+
+    # 要確認ファイルの詳細
+    non_ok = [f for f in report.files if f.status != "success"]
+    if non_ok:
+        lines.append("## 要確認ファイル\n")
+        for f in non_ok:
+            sql_name = Path(f.sql_path).name if f.sql_path else "(未出力)"
+            lines.append(f"### {sql_name}\n")
+            if f.error:
+                lines.append(f"- **エラー**: {f.error}")
+            for w in f.warnings:
+                lines.append(f"- {w}")
+            lines.append("")
+
+    summary_path = out_dir / "summary.md"
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"サマリー出力: {summary_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
