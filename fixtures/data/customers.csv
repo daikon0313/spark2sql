@@ -1,0 +1,6 @@
+customer_id,name,email,tier
+C001,Alice Tanaka,alice@example.com,gold
+C002,Bob Sato,bob@example.com,silver
+C003,Carol Yamada,carol@example.com,gold
+C004,Dave Ito,dave@example.com,bronze
+C005,Eve Suzuki,eve@example.com,silver

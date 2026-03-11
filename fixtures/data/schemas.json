@@ -1,0 +1,28 @@
+{
+  "raw.orders": {
+    "columns": [
+      {"name": "order_id",    "type": "INT64"},
+      {"name": "customer_id", "type": "STRING"},
+      {"name": "region",      "type": "STRING"},
+      {"name": "status",      "type": "STRING"},
+      {"name": "amount",      "type": "FLOAT64"},
+      {"name": "order_date",  "type": "DATE"}
+    ]
+  },
+  "raw.customers": {
+    "columns": [
+      {"name": "customer_id", "type": "STRING"},
+      {"name": "name",        "type": "STRING"},
+      {"name": "email",       "type": "STRING"},
+      {"name": "tier",        "type": "STRING"}
+    ]
+  },
+  "raw.products": {
+    "columns": [
+      {"name": "product_id",   "type": "STRING"},
+      {"name": "product_name", "type": "STRING"},
+      {"name": "category",     "type": "STRING"},
+      {"name": "price",        "type": "FLOAT64"}
+    ]
+  }
+}

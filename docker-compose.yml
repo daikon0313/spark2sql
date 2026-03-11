@@ -1,0 +1,82 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────
+# PySpark ↔ BigQuery SQL (DuckDB) ローカル検証環境
+#
+# 起動:
+#   docker compose up -d
+#
+# Spark UI:       http://localhost:4040
+# Jupyter:        http://localhost:8888  (token: dev)
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Spark Master ────────────────────────────────────────────────────
+  spark-master:
+    image: bitnami/spark:3.5
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "4040:4040"   # Spark UI
+      - "7077:7077"   # Spark Master
+      - "8080:8080"   # Spark Master Web UI
+    volumes:
+      - ./:/app
+      - ./fixtures:/fixtures
+      - spark-data:/tmp/spark-data
+    networks:
+      - spark-net
+
+  # ── Spark Worker ────────────────────────────────────────────────────
+  spark-worker:
+    image: bitnami/spark:3.5
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+    depends_on:
+      - spark-master
+    volumes:
+      - ./:/app
+      - ./fixtures:/fixtures
+      - spark-data:/tmp/spark-data
+    networks:
+      - spark-net
+
+  # ── Jupyter (PySpark + DuckDB を同じカーネルで使える) ──────────────
+  jupyter:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: jupyter
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=dev
+      - PYSPARK_SUBMIT_ARGS=--master spark://spark-master:7077 pyspark-shell
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./:/home/jovyan/work
+      - ./fixtures:/home/jovyan/fixtures
+    depends_on:
+      - spark-master
+    networks:
+      - spark-net
+    command: >
+      bash -c "pip install duckdb pandas pyarrow --quiet &&
+               start-notebook.sh --NotebookApp.token='dev'"
+
+volumes:
+  spark-data:
+
+networks:
+  spark-net:
+    driver: bridge
